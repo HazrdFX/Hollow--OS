@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>HazardFX · Dicyanin Spectral Filter</title>
+<style>
+  :root{--v:#9d4edd;--vd:#7b2cbf;--t:#00f5d4;--bg:#000;--ink:#cfc6ff}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:12px/1.3 ui-monospace,"Roboto Mono",monospace;overflow:hidden;touch-action:none}
+  canvas{position:fixed;inset:0;width:100vw;height:100vh;display:block}
+  #hud{position:fixed;top:env(safe-area-inset-top,0);left:0;right:0;padding:8px 10px;display:flex;justify-content:space-between;pointer-events:none;text-shadow:0 0 4px #000}
+  #hud b{color:var(--t);font-weight:600}
+  #rec{color:#ff3b6b;display:none}
+  #bar{position:fixed;left:0;right:0;bottom:0;padding:8px 8px calc(8px + env(safe-area-inset-bottom,0));background:linear-gradient(transparent,#000c 30%)}
+  #btns{display:flex;gap:6px;justify-content:space-between}
+  button{flex:1;padding:12px 0;background:#0a0612;border:1px solid var(--vd);color:var(--ink);border-radius:8px;font:inherit;font-weight:600;letter-spacing:.06em}
+  button:active,button.on{background:var(--vd);color:#fff;border-color:var(--t)}
+  #panel{display:grid;grid-template-columns:1fr;gap:6px;margin-bottom:8px}
+  #panel.hide{display:none}
+  .row{display:grid;grid-template-columns:118px 1fr 40px;align-items:center;gap:8px}
+  .row span:last-child{text-align:right;color:var(--t)}
+  input[type=range]{width:100%;accent-color:var(--v);height:26px}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:#000;text-align:center;padding:24px}
+  #start h1{margin:0;font-size:18px;color:var(--v);letter-spacing:.15em}
+  #start p{margin:0;max-width:320px;opacity:.75}
+  #start button{flex:none;padding:14px 28px}
+  #err{color:#ff6b8b;max-width:320px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="hud">
+  <div>DICYANIN · <b id="fps">--</b> fps · <span id="res">--</span></div>
+  <div id="rec">● REC</div>
+  <div>AWB <b id="awb">--</b> · ISO <b id="iso">--</b> · EV <b id="ev">--</b></div>
+</div>
+
+<div id="bar">
+  <div id="panel">
+    <div class="row"><span>Spectral notch</span><input id="notch" type="range" min="0" max="1" step="0.01" value="0.92"><span></span></div>
+    <div class="row"><span>Far-red / IR leak</span><input id="ir" type="range" min="0" max="3" step="0.01" value="1"><span></span></div>
+    <div class="row"><span>Aura gain</span><input id="aura" type="range" min="0" max="3" step="0.01" value="1.2"><span></span></div>
+    <div class="row"><span>Aura radius</span><input id="radius" type="range" min="0.5" max="6" step="0.1" value="2.5"><span></span></div>
+    <div class="row"><span>Edge threshold</span><input id="thresh" type="range" min="0.02" max="0.6" step="0.01" value="0.12"><span></span></div>
+    <div class="row"><span>Retinal decay</span><input id="persist" type="range" min="0" max="0.4" step="0.01" value="0.18"><span></span></div>
+    <div class="row"><span>Chromatic split</span><input id="ca" type="range" min="0" max="0.02" step="0.0005" value="0.004"><span></span></div>
+    <div class="row"><span>Exposure (EV)</span><input id="evs" type="range" min="-2" max="1" step="0.1" value="-1"><span></span></div>
+  </div>
+  <div id="btns">
+    <button id="bCmp">HOLD RAW</button>
+    <button id="bSnap">SNAP</button>
+    <button id="bRec">REC</button>
+    <button id="bFlip">FLIP</button>
+    <button id="bPanel" class="on">TUNE</button>
+  </div>
+</div>
+
+<div id="start">
+  <h1>DICYANIN SPECTRAL FILTER</h1>
+  <p>Kilner-screen simulation: green-band notch, violet + far-red dual band, boundary aura, retinal persistence.</p>
+  <button id="go">START CAMERA</button>
+  <div id="err"></div>
+</div>
+
+<video id="v" playsinline muted autoplay style="display:none"></video>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const cv = $('c'), video = $('v');
+const gl = cv.getContext('webgl2', {preserveDrawingBuffer:true, antialias:false, alpha:false});
+let facing = 'environment', stream = null, track = null;
+
+/* ---------- shaders ---------- */
+const VS = `#version 300 es
+in vec2 p; out vec2 uv;
+void main(){ uv = p*0.5+0.5; gl_Position = vec4(p,0.,1.); }`;
+
+const FS_BAND = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o;
+uniform sampler2D src; uniform float notch, ir;
+void main(){
+  vec3 c = texture(src, uv).rgb;
+  float g = c.g * mix(1.0, 0.08, notch);                 // 500-590nm absorption notch
+  float b = c.b*1.45 + c.r*0.35;                         // deep indigo / violet band
+  float r = max(0.0, c.r - c.g) * 1.6 * ir;              // far-red spectral leak
+  vec3 k = vec3(mix(c.r, r, notch), g, mix(c.b, b, notch));
+  o = vec4(clamp(k, 0.0, 1.0), 1.0);
+}`;
+
+const FS_SOBEL = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o;
+uniform sampler2D src; uniform vec2 tx; uniform float th;
+float L(vec2 d){ return dot(texture(src, uv + d*tx).rgb, vec3(0.299,0.587,0.114)); }
+void main(){
+  float a=L(vec2(-1,-1)), b=L(vec2(0,-1)), c=L(vec2(1,-1));
+  float d=L(vec2(-1, 0)),                 f=L(vec2(1, 0));
+  float g=L(vec2(-1, 1)), h=L(vec2(0, 1)), i=L(vec2(1, 1));
+  float gx = -a - 2.*d - g + c + 2.*f + i;
+  float gy = -a - 2.*b - c + g + 2.*h + i;
+  float m = length(vec2(gx, gy));
+  float e = smoothstep(th, th + 0.18, m);
+  vec3 violet = vec3(0.482, 0.173, 0.749);               // #7B2CBF
+  vec3 teal   = vec3(0.0,   0.961, 0.831);               // #00F5D4
+  o = vec4(mix(violet, teal, clamp((m - th) * 2.5, 0., 1.)) * e, 1.0);
+}`;
+
+const FS_BLUR = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o;
+uniform sampler2D src; uniform vec2 dir;
+void main(){
+  vec3 s = texture(src, uv).rgb * 0.227027;
+  s += (texture(src, uv + dir*1.3846).rgb + texture(src, uv - dir*1.3846).rgb) * 0.316216;
+  s += (texture(src, uv + dir*3.2308).rgb + texture(src, uv - dir*3.2308).rgb) * 0.070270;
+  o = vec4(s, 1.0);
+}`;
+
+const FS_COMP = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o;
+uniform sampler2D base, aura, edge, prev; uniform float gain, persist;
+void main(){
+  vec3 b = texture(base, uv).rgb;
+  vec3 a = (texture(aura, uv).rgb * 1.6 + texture(edge, uv).rgb * 0.35) * gain;
+  vec3 c = 1.0 - (1.0 - b) * (1.0 - clamp(a, 0., 1.));  // screen blend halo
+  vec3 p = texture(prev, uv).rgb;
+  vec3 r = mix(c, p, persist);                           // N-1 retinal persistence
+  o = vec4(max(r, c * 0.92), 1.0);                       // keep the live frame crisp
+}`;
+
+const FS_OUT = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o;
+uniform sampler2D fx, raw; uniform vec2 sc; uniform float ca; uniform int cmp;
+void main(){
+  vec2 t = (uv - 0.5) * sc + 0.5;                        // cover-fit
+  if (cmp == 1 && uv.x < 0.5) { o = vec4(texture(raw, t).rgb, 1.); return; }
+  vec2 d = (t - 0.5) * ca * 2.0;
+  vec3 c = vec3(texture(fx, t + d).r, texture(fx, t).g, texture(fx, t - d).b);
+  if (cmp == 1 && abs(uv.x - 0.5) < 0.0015) c = vec3(0., 0.96, 0.83);
+  o = vec4(c, 1.0);
+}`;
+
+function compile(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(fs){
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.bindAttribLocation(p, 0, 'p'); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++){ const name = gl.getActiveUniform(p, i).name; u[name] = gl.getUniformLocation(p, name); }
+  return {p, u};
+}
+
+let P;
+function initGL(){
+  P = { band:program(FS_BAND), sobel:program(FS_SOBEL), blur:program(FS_BLUR), comp:program(FS_COMP), out:program(FS_OUT) };
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+}
+
+function tex(w, h){
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function fbo(w, h){ const t = tex(w, h), f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return {t, f, w, h}; }
+
+let W = 0, H = 0, rawTex, F = {}, ping = 0;
+function alloc(vw, vh){
+  const s = Math.min(1, 1280 / Math.max(vw, vh));
+  W = Math.round(vw * s); H = Math.round(vh * s);
+  rawTex = tex(W, H);
+  F.band = fbo(W, H); F.edge = fbo(W, H);
+  const bw = W >> 1, bh = H >> 1;                       // half-res bloom saves GPU
+  F.bh = fbo(bw, bh); F.bv = fbo(bw, bh);
+  F.h = [fbo(W, H), fbo(W, H)];
+  $('res').textContent = vw + '×' + vh;
+}
+
+function pass(prog, target, texs, setU){
+  gl.useProgram(prog.p);
+  if (target){ gl.bindFramebuffer(gl.FRAMEBUFFER, target.f); gl.viewport(0, 0, target.w, target.h); }
+  else { gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, cv.width, cv.height); }
+  let i = 0; for (const k in texs){ gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, texs[k]); gl.uniform1i(prog.u[k], i); i++; }
+  if (setU) setU(prog.u);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+/* ---------- controls ---------- */
+const S = {};
+document.querySelectorAll('#panel input').forEach(el => {
+  const out = el.parentElement.lastElementChild;
+  const upd = () => { S[el.id] = parseFloat(el.value); out.textContent = (+el.value).toFixed(el.step < 0.01 ? 3 : 2); };
+  el.addEventListener('input', upd); upd();
+});
+$('evs').addEventListener('change', () => lockSensor());
+let cmp = 0;
+const bC = $('bCmp');
+['pointerdown'].forEach(e => bC.addEventListener(e, () => { cmp = 1; bC.classList.add('on'); }));
+['pointerup','pointerleave','pointercancel'].forEach(e => bC.addEventListener(e, () => { cmp = 0; bC.classList.remove('on'); }));
+$('bPanel').onclick = e => { $('panel').classList.toggle('hide'); e.target.classList.toggle('on'); };
+$('bFlip').onclick = () => { facing = facing === 'environment' ? 'user' : 'environment'; startCam(); };
+
+/* ---------- camera + sensor lock ---------- */
+async function startCam(){
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({ audio:false,
+    video:{ facingMode:{ideal:facing}, width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:60} } });
+  track = stream.getVideoTracks()[0];
+  video.srcObject = stream; await video.play();
+  await lockSensor();
+}
+
+async function lockSensor(){
+  if (!track || !track.getCapabilities) { $('awb').textContent = 'n/a'; return; }
+  const cap = track.getCapabilities(), adv = {};
+  if (cap.whiteBalanceMode && cap.whiteBalanceMode.includes('manual')){
+    adv.whiteBalanceMode = 'manual';
+    if (cap.colorTemperature) adv.colorTemperature = Math.min(cap.colorTemperature.max, Math.max(cap.colorTemperature.min, 5500));
+  }
+  if (cap.exposureCompensation){
+    const ec = cap.exposureCompensation;
+    adv.exposureCompensation = Math.min(ec.max, Math.max(ec.min, S.evs));
+  }
+  try { if (Object.keys(adv).length) await track.applyConstraints({advanced:[adv]}); } catch(e) {}
+  telemetry();
+}
+
+function telemetry(){
+  if (!track) return {};
+  const s = track.getSettings ? track.getSettings() : {};
+  $('awb').textContent = s.whiteBalanceMode === 'manual' ? 'LOCK ' + (s.colorTemperature || '') + 'K' : (s.whiteBalanceMode || 'auto');
+  $('iso').textContent = s.iso || 'auto';
+  $('ev').textContent = s.exposureCompensation != null ? (+s.exposureCompensation).toFixed(1) : 'n/a';
+  return s;
+}
+setInterval(telemetry, 1500);
+
+/* ---------- render loop ---------- */
+let last = performance.now(), frames = 0;
+function frame(){
+  requestAnimationFrame(frame);
+  if (video.readyState < 2 || !video.videoWidth) return;
+  if (!W || Math.abs(W / H - video.videoWidth / video.videoHeight) > 0.01) alloc(video.videoWidth, video.videoHeight);
+
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const cw = Math.round(innerWidth * dpr), ch = Math.round(innerHeight * dpr);
+  if (cv.width !== cw || cv.height !== ch){ cv.width = cw; cv.height = ch; }
+
+  gl.bindTexture(gl.TEXTURE_2D, rawTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+
+  // Pass 1: spectral band-pass
+  pass(P.band, F.band, {src:rawTex}, u => { gl.uniform1f(u.notch, S.notch); gl.uniform1f(u.ir, S.ir); });
+  // Pass 2: Sobel boundary + separable Gaussian aura
+  pass(P.sobel, F.edge, {src:rawTex}, u => { gl.uniform2f(u.tx, 1/W, 1/H); gl.uniform1f(u.th, S.thresh); });
+  pass(P.blur, F.bh, {src:F.edge.t}, u => gl.uniform2f(u.dir, S.radius / F.bh.w, 0));
+  pass(P.blur, F.bv, {src:F.bh.t},   u => gl.uniform2f(u.dir, 0, S.radius / F.bv.h));
+  // Pass 3: composite + ping-pong retinal persistence
+  const prev = F.h[ping], cur = F.h[ping ^ 1];
+  pass(P.comp, cur, {base:F.band.t, aura:F.bv.t, edge:F.edge.t, prev:prev.t},
+       u => { gl.uniform1f(u.gain, S.aura); gl.uniform1f(u.persist, S.persist); });
+  ping ^= 1;
+  // Pass 4: chromatic aberration + compare split -> screen
+  const va = W / H, sa = cw / ch;
+  const sc = sa > va ? [1, va / sa] : [sa / va, 1];
+  pass(P.out, null, {fx:cur.t, raw:rawTex}, u => {
+    gl.uniform2f(u.sc, sc[0], sc[1]); gl.uniform1f(u.ca, S.ca); gl.uniform1i(u.cmp, cmp);
+  });
+
+  frames++; const now = performance.now();
+  if (now - last > 1000){ $('fps').textContent = Math.round(frames * 1000 / (now - last)); frames = 0; last = now; }
+}
+
+/* ---------- capture: PNG with telemetry tEXt chunk ---------- */
+const crcT = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++){ let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc(b){ let c = 0xffffffff; for (const x of b) c = crcT[(c ^ x) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+function addText(png, key, val){
+  const data = new TextEncoder().encode(key + '\0' + val), type = new TextEncoder().encode('tEXt');
+  const chunk = new Uint8Array(12 + data.length), dv = new DataView(chunk.buffer);
+  dv.setUint32(0, data.length); chunk.set(type, 4); chunk.set(data, 8);
+  const body = new Uint8Array(4 + data.length); body.set(type); body.set(data, 4);
+  dv.setUint32(8 + data.length, crc(body));
+  const out = new Uint8Array(png.length + chunk.length);
+  out.set(png.subarray(0, 33)); out.set(chunk, 33); out.set(png.subarray(33), 33 + chunk.length);   // after IHDR
+  return out;
+}
+function save(blob, name){ const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000); }
+function stamp(){ return new Date().toISOString().replace(/[:.]/g, '-'); }
+function meta(){ const s = telemetry(); return JSON.stringify({
+  iso:s.iso, exposureTime:s.exposureTime, exposureCompensation:s.exposureCompensation,
+  whiteBalanceMode:s.whiteBalanceMode, colorTemperature:s.colorTemperature, facing,
+  profile:{notch:S.notch, irLeak:S.ir, auraGain:S.aura, auraRadius:S.radius, edgeThreshold:S.thresh, persistence:S.persist, chromatic:S.ca} }); }
+
+$('bSnap').onclick = () => cv.toBlob(async b => {
+  const png = new Uint8Array(await b.arrayBuffer());
+  save(new Blob([addText(png, 'HazardFX-Dicyanin', meta())], {type:'image/png'}), 'dicyanin-' + stamp() + '.png');
+}, 'image/png');
+
+let rec = null, chunks = [];
+$('bRec').onclick = e => {
+  if (rec){ rec.stop(); return; }
+  const types = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm'];
+  const type = types.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+  rec = new MediaRecorder(cv.captureStream(60), {mimeType:type, videoBitsPerSecond:16e6});
+  chunks = []; rec.ondataavailable = d => d.data.size && chunks.push(d.data);
+  rec.onstop = () => { const ext = type.includes('mp4') ? 'mp4' : 'webm';
+    save(new Blob(chunks, {type:type || 'video/webm'}), 'dicyanin-' + stamp() + '.' + ext);
+    save(new Blob([meta()], {type:'application/json'}), 'dicyanin-' + stamp() + '.json');
+    rec = null; e.target.classList.remove('on'); $('rec').style.display = 'none'; };
+  rec.start(500); e.target.classList.add('on'); $('rec').style.display = 'block';
+};
+
+/* ---------- boot ---------- */
+$('go').onclick = async () => {
+  try {
+    if (!gl) throw new Error('WebGL2 not available in this browser.');
+    if (!window.isSecureContext) throw new Error('Camera needs HTTPS. Open this from an https:// address (GitHub Pages, Vercel) rather than a downloaded file.');
+    initGL(); await startCam();
+    $('start').style.display = 'none'; requestAnimationFrame(frame);
+  } catch (err) { $('err').textContent = err.message || String(err); }
+};
+</script>
+</body>
+</html>
