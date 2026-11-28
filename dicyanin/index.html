@@ -17,6 +17,9 @@
   #btns{display:flex;gap:6px;justify-content:space-between}
   button{flex:1;padding:12px 0;background:#0a0612;border:1px solid var(--vd);color:var(--ink);border-radius:8px;font:inherit;font-weight:600;letter-spacing:.06em}
   button:active,button.on{background:var(--vd);color:#fff;border-color:var(--t)}
+  #modes{display:flex;gap:6px;overflow-x:auto;margin-bottom:8px;scrollbar-width:none}
+  #modes button{flex:0 0 auto;padding:8px 12px;font-size:11px}
+  #dim{color:var(--t)}
   #panel{display:grid;grid-template-columns:1fr;gap:6px;margin-bottom:8px}
   #panel.hide{display:none}
   .row{display:grid;grid-template-columns:118px 1fr 40px;align-items:center;gap:8px}
@@ -33,12 +36,13 @@
 <canvas id="c"></canvas>
 
 <div id="hud">
-  <div>DICYANIN · <b id="fps">--</b> fps · <span id="res">--</span></div>
+  <div><span id="dim">DICYANIN</span> · <b id="fps">--</b> fps · <span id="res">--</span></div>
   <div id="rec">● REC</div>
   <div>AWB <b id="awb">--</b> · ISO <b id="iso">--</b> · EV <b id="ev">--</b></div>
 </div>
 
 <div id="bar">
+  <div id="modes"></div>
   <div id="panel">
     <div class="row"><span>Spectral notch</span><input id="notch" type="range" min="0" max="1" step="0.01" value="0.92"><span></span></div>
     <div class="row"><span>Far-red / IR leak</span><input id="ir" type="range" min="0" max="3" step="0.01" value="1"><span></span></div>
@@ -93,7 +97,7 @@ void main(){
 
 const FS_SOBEL = `#version 300 es
 precision highp float; in vec2 uv; out vec4 o;
-uniform sampler2D src; uniform vec2 tx; uniform float th;
+uniform sampler2D src; uniform vec2 tx; uniform float th; uniform vec3 c1, c2;
 float L(vec2 d){ return dot(texture(src, uv + d*tx).rgb, vec3(0.299,0.587,0.114)); }
 void main(){
   float a=L(vec2(-1,-1)), b=L(vec2(0,-1)), c=L(vec2(1,-1));
@@ -103,9 +107,7 @@ void main(){
   float gy = -a - 2.*b - c + g + 2.*h + i;
   float m = length(vec2(gx, gy));
   float e = smoothstep(th, th + 0.18, m);
-  vec3 violet = vec3(0.482, 0.173, 0.749);               // #7B2CBF
-  vec3 teal   = vec3(0.0,   0.961, 0.831);               // #00F5D4
-  o = vec4(mix(violet, teal, clamp((m - th) * 2.5, 0., 1.)) * e, 1.0);
+  o = vec4(mix(c1, c2, clamp((m - th) * 2.5, 0., 1.)) * e, 1.0);   // per-dimension halo palette
 }`;
 
 const FS_BLUR = `#version 300 es
@@ -132,12 +134,16 @@ void main(){
 
 const FS_OUT = `#version 300 es
 precision highp float; in vec2 uv; out vec4 o;
-uniform sampler2D fx, raw; uniform vec2 sc; uniform float ca; uniform int cmp;
+uniform sampler2D fx, raw; uniform vec2 sc; uniform float ca, inv, desat, gam; uniform vec3 tint; uniform int cmp;
 void main(){
   vec2 t = (uv - 0.5) * sc + 0.5;                        // cover-fit
   if (cmp == 1 && uv.x < 0.5) { o = vec4(texture(raw, t).rgb, 1.); return; }
   vec2 d = (t - 0.5) * ca * 2.0;
   vec3 c = vec3(texture(fx, t + d).r, texture(fx, t).g, texture(fx, t - d).b);
+  float l = dot(c, vec3(0.299, 0.587, 0.114));
+  c = mix(c, vec3(l), desat);                            // dimension grade
+  c = mix(c, 1.0 - c, inv);
+  c = pow(clamp(c * tint, 0., 1.), vec3(gam));
   if (cmp == 1 && abs(uv.x - 0.5) < 0.0015) c = vec3(0., 0.96, 0.83);
   o = vec4(c, 1.0);
 }`;
@@ -200,6 +206,26 @@ function pass(prog, target, texs, setU){
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
 
+/* ---------- dimensions (presets) ---------- */
+const hex = h => [1,3,5].map(i => parseInt(h.substr(i, 2), 16) / 255);
+const DIMS = {
+  Dicyanin: {s:{notch:.92, ir:1,   aura:1.2, radius:2.5, thresh:.12, persist:.18, ca:.004},  c1:'#7B2CBF', c2:'#00F5D4', tint:[1,1,1],        inv:0, desat:0,   gam:1},
+  Etheric:  {s:{notch:.6,  ir:.4,  aura:2.2, radius:1.2, thresh:.07, persist:.08, ca:.002},  c1:'#7FC8FF', c2:'#F2FBFF', tint:[.85,.97,1.12], inv:0, desat:.25, gam:1},
+  Astral:   {s:{notch:.85, ir:.8,  aura:1.7, radius:5.5, thresh:.1,  persist:.36, ca:.009},  c1:'#C77DFF', c2:'#FF6FD8', tint:[1.08,.85,1.2], inv:0, desat:0,   gam:.9},
+  Shadow:   {s:{notch:1,   ir:.2,  aura:1.5, radius:3,   thresh:.15, persist:.26, ca:.003},  c1:'#3A0CA3', c2:'#4CC9F0', tint:[.75,.75,.95], inv:0, desat:.85, gam:1.5},
+  Void:     {s:{notch:.9,  ir:.6,  aura:2.6, radius:2,   thresh:.1,  persist:.2,  ca:.011},  c1:'#00F5D4', c2:'#FFFFFF', tint:[1,1,1],        inv:1, desat:.6,  gam:1.2},
+  Infernal: {s:{notch:1,   ir:3,   aura:1.4, radius:3.5, thresh:.12, persist:.15, ca:.005},  c1:'#FF0054', c2:'#FFBD00', tint:[1.3,.6,.55],  inv:0, desat:0,   gam:1.1},
+};
+let G = {};
+function setDim(name){
+  const d = DIMS[name];
+  G = {c1:hex(d.c1), c2:hex(d.c2), tint:d.tint, inv:d.inv, desat:d.desat, gam:d.gam};
+  for (const k in d.s){ const el = $(k); el.value = d.s[k]; el.dispatchEvent(new Event('input')); }
+  document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', b.textContent === name.toUpperCase()));
+  $('dim').textContent = name.toUpperCase(); G.name = name;
+}
+for (const n in DIMS){ const b = document.createElement('button'); b.textContent = n.toUpperCase(); b.onclick = () => setDim(n); $('modes').appendChild(b); }
+
 /* ---------- controls ---------- */
 const S = {};
 document.querySelectorAll('#panel input').forEach(el => {
@@ -207,6 +233,7 @@ document.querySelectorAll('#panel input').forEach(el => {
   const upd = () => { S[el.id] = parseFloat(el.value); out.textContent = (+el.value).toFixed(el.step < 0.01 ? 3 : 2); };
   el.addEventListener('input', upd); upd();
 });
+setDim('Dicyanin');
 $('evs').addEventListener('change', () => lockSensor());
 let cmp = 0;
 const bC = $('bCmp');
@@ -268,7 +295,7 @@ function frame(){
   // Pass 1: spectral band-pass
   pass(P.band, F.band, {src:rawTex}, u => { gl.uniform1f(u.notch, S.notch); gl.uniform1f(u.ir, S.ir); });
   // Pass 2: Sobel boundary + separable Gaussian aura
-  pass(P.sobel, F.edge, {src:rawTex}, u => { gl.uniform2f(u.tx, 1/W, 1/H); gl.uniform1f(u.th, S.thresh); });
+  pass(P.sobel, F.edge, {src:rawTex}, u => { gl.uniform2f(u.tx, 1/W, 1/H); gl.uniform1f(u.th, S.thresh); gl.uniform3fv(u.c1, G.c1); gl.uniform3fv(u.c2, G.c2); });
   pass(P.blur, F.bh, {src:F.edge.t}, u => gl.uniform2f(u.dir, S.radius / F.bh.w, 0));
   pass(P.blur, F.bv, {src:F.bh.t},   u => gl.uniform2f(u.dir, 0, S.radius / F.bv.h));
   // Pass 3: composite + ping-pong retinal persistence
@@ -281,6 +308,7 @@ function frame(){
   const sc = sa > va ? [1, va / sa] : [sa / va, 1];
   pass(P.out, null, {fx:cur.t, raw:rawTex}, u => {
     gl.uniform2f(u.sc, sc[0], sc[1]); gl.uniform1f(u.ca, S.ca); gl.uniform1i(u.cmp, cmp);
+    gl.uniform1f(u.inv, G.inv); gl.uniform1f(u.desat, G.desat); gl.uniform1f(u.gam, G.gam); gl.uniform3fv(u.tint, G.tint);
   });
 
   frames++; const now = performance.now();
@@ -304,12 +332,12 @@ function save(blob, name){ const a = document.createElement('a'); a.href = URL.c
 function stamp(){ return new Date().toISOString().replace(/[:.]/g, '-'); }
 function meta(){ const s = telemetry(); return JSON.stringify({
   iso:s.iso, exposureTime:s.exposureTime, exposureCompensation:s.exposureCompensation,
-  whiteBalanceMode:s.whiteBalanceMode, colorTemperature:s.colorTemperature, facing,
+  whiteBalanceMode:s.whiteBalanceMode, colorTemperature:s.colorTemperature, facing, dimension:G.name,
   profile:{notch:S.notch, irLeak:S.ir, auraGain:S.aura, auraRadius:S.radius, edgeThreshold:S.thresh, persistence:S.persist, chromatic:S.ca} }); }
 
 $('bSnap').onclick = () => cv.toBlob(async b => {
   const png = new Uint8Array(await b.arrayBuffer());
-  save(new Blob([addText(png, 'HazardFX-Dicyanin', meta())], {type:'image/png'}), 'dicyanin-' + stamp() + '.png');
+  save(new Blob([addText(png, 'HazardFX-Dicyanin', meta())], {type:'image/png'}), G.name.toLowerCase() + '-' + stamp() + '.png');
 }, 'image/png');
 
 let rec = null, chunks = [];
