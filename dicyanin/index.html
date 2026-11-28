@@ -245,8 +245,13 @@ $('bFlip').onclick = () => { facing = facing === 'environment' ? 'user' : 'envir
 /* ---------- camera + sensor lock ---------- */
 async function startCam(){
   if (stream) stream.getTracks().forEach(t => t.stop());
-  stream = await navigator.mediaDevices.getUserMedia({ audio:false,
-    video:{ facingMode:{ideal:facing}, width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:60} } });
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio:false,
+      video:{ facingMode:{ideal:facing}, width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:60} } });
+  } catch (e) {
+    if (e.name === 'NotAllowedError') throw new Error('Camera permission was blocked. Tap the lock icon by the address bar, allow Camera, then reload.');
+    stream = await navigator.mediaDevices.getUserMedia({ audio:false, video:{ facingMode:facing } });   // fallback, no size/fps asks
+  }
   track = stream.getVideoTracks()[0];
   video.srcObject = stream; await video.play();
   await lockSensor();
@@ -355,13 +360,17 @@ $('bRec').onclick = e => {
 };
 
 /* ---------- boot ---------- */
+function showErr(m){ const st = $('start'); st.style.display = 'flex'; $('err').textContent = m; }
+window.addEventListener('error', e => showErr('Error: ' + e.message));
+window.addEventListener('unhandledrejection', e => showErr('Error: ' + (e.reason && e.reason.message || e.reason)));
 $('go').onclick = async () => {
   try {
     if (!gl) throw new Error('WebGL2 not available in this browser.');
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('This in-app browser has no camera access. Tap the menu and choose Open in Chrome.');
     if (!window.isSecureContext) throw new Error('Camera needs HTTPS. Open this from an https:// address (GitHub Pages, Vercel) rather than a downloaded file.');
     initGL(); await startCam();
     $('start').style.display = 'none'; requestAnimationFrame(frame);
-  } catch (err) { $('err').textContent = err.message || String(err); }
+  } catch (err) { showErr(err.message || String(err)); }
 };
 </script>
 </body>
